@@ -5,11 +5,11 @@ plugins {
 }
 
 android {
-    namespace = "com.milk.cam"
+    namespace = "com.metacam"
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.milk.cam"
+        applicationId = "com.metacam"
         minSdk = 26
         targetSdk = 34
         versionCode = 1
@@ -36,4 +36,5 @@ dependencies {
     implementation("androidx.camera:camera-lifecycle:1.3.4")
     implementation("androidx.camera:camera-video:1.3.4")
     implementation("androidx.camera:camera-view:1.3.4")
+    implementation("androidx.exifinterface:exifinterface:1.3.7")
 }
