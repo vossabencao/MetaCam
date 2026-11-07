@@ -7,6 +7,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.BitmapFactory
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.provider.OpenableColumns
 import android.view.WindowManager
@@ -35,6 +36,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -115,14 +118,143 @@ fun Root(incoming: MutableState<List<Uri>>) {
                     icon = { Box(Modifier.size(1.dp)) },
                     label = { Text("Limpeza") }
                 )
+                NavigationBarItem(
+                    selected = tab == 2,
+                    enabled = !busy.value,
+                    onClick = { tab = 2 },
+                    icon = { Box(Modifier.size(1.dp)) },
+                    label = { Text("Config") }
+                )
             }
         }
     ) { pad ->
         Box(Modifier.padding(pad).fillMaxSize()) {
-            if (tab == 0) CameraTab() else CleanScreen(incoming, busy)
+            when (tab) {
+                0 -> CameraTab()
+                1 -> CleanScreen(incoming, busy)
+                else -> SettingsScreen()
+            }
         }
     }
 }
+
+// ---------------- Exportar para a galeria ----------------
+
+@Composable
+fun rememberGalleryExporter(onDone: (String) -> Unit): (List<File>) -> Unit {
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var pending by remember { mutableStateOf<List<File>>(emptyList()) }
+
+    fun run(list: List<File>) {
+        scope.launch {
+            val delAfter = Prefs.deleteAfterExport(ctx)
+            val r = withContext(Dispatchers.IO) {
+                var ok = 0
+                var fail = 0
+                var removed = 0
+                for (f in list) {
+                    if (Gallery.export(ctx, f).isSuccess) {
+                        ok++
+                        if (delAfter) {
+                            Vault.wipe(f)
+                            removed++
+                        }
+                    } else {
+                        fail++
+                    }
+                }
+                Triple(ok, fail, removed)
+            }
+            var msg = if (r.first == 0) "Nada foi exportado" else "${r.first} exportado(s) para a galeria"
+            if (r.third > 0) msg += ", ${r.third} apagado(s) do app"
+            if (r.second > 0) msg += ", ${r.second} falhou(aram)"
+            onDone(msg)
+        }
+    }
+
+    val perm = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { ok ->
+        val l = pending
+        pending = emptyList()
+        if (ok) run(l) else onDone("Permissão de armazenamento negada")
+    }
+
+    return { list ->
+        if (list.isNotEmpty()) {
+            if (Build.VERSION.SDK_INT <= 28 &&
+                ContextCompat.checkSelfPermission(
+                    ctx, Manifest.permission.WRITE_EXTERNAL_STORAGE
+                ) != PackageManager.PERMISSION_GRANTED
+            ) {
+                pending = list
+                perm.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+            } else {
+                run(list)
+            }
+        }
+    }
+}
+
+// ---------------- Configurações ----------------
+
+@Composable
+fun SettingsScreen() {
+    val ctx = LocalContext.current
+    var del by remember { mutableStateOf(Prefs.deleteAfterExport(ctx)) }
+
+    Column(
+        Modifier.fillMaxSize().statusBarsPadding()
+            .verticalScroll(rememberScrollState()).padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Text("Configurações", style = MaterialTheme.typography.headlineSmall)
+
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("Apagar do app após exportar", style = MaterialTheme.typography.bodyLarge)
+                Text(
+                    "Depois de exportar para a galeria com sucesso, o arquivo é sobrescrito " +
+                        "e excluído do cofre e da lista de arquivos limpos. Se a exportação " +
+                        "falhar, nada é apagado.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+            Spacer(Modifier.width(8.dp))
+            Switch(
+                checked = del,
+                onCheckedChange = {
+                    del = it
+                    Prefs.setDeleteAfterExport(ctx, it)
+                }
+            )
+        }
+
+        HorizontalDivider()
+
+        Text("Onde ficam os arquivos exportados", style = MaterialTheme.typography.titleMedium)
+        Text("Fotos: Pictures/MetaCam", style = MaterialTheme.typography.bodySmall)
+        Text("Vídeos: Movies/MetaCam", style = MaterialTheme.typography.bodySmall)
+        Text("Áudios: Music/MetaCam", style = MaterialTheme.typography.bodySmall)
+        Text(
+            "PDF e documentos: Download/MetaCam (não aparecem na galeria)",
+            style = MaterialTheme.typography.bodySmall
+        )
+
+        HorizontalDivider()
+
+        Text("Atenção", style = MaterialTheme.typography.titleMedium)
+        Text(
+            "Na galeria, o arquivo deixa de ser privado. Apps com acesso a fotos e vídeos " +
+                "conseguem lê-lo, e a galeria ou o backup em nuvem do aparelho pode enviá-lo. " +
+                "A data de exibição será a de hoje, e não a original.",
+            style = MaterialTheme.typography.bodySmall
+        )
+    }
+}
+
+// ---------------- Câmera ----------------
 
 @Composable
 fun CameraTab() {
@@ -319,6 +451,11 @@ fun VaultScreen(onBack: () -> Unit) {
     val ctx = LocalContext.current
     var files by remember { mutableStateOf(Vault.list(ctx)) }
     var del by remember { mutableStateOf<File?>(null) }
+    var info by remember { mutableStateOf<String?>(null) }
+    val export = rememberGalleryExporter { msg ->
+        info = msg
+        files = Vault.list(ctx)
+    }
 
     Column(Modifier.fillMaxSize().statusBarsPadding()) {
         Row(
@@ -327,6 +464,18 @@ fun VaultScreen(onBack: () -> Unit) {
         ) {
             TextButton(onClick = onBack) { Text("< Voltar") }
             Text("${files.size} itens no cofre")
+        }
+        Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp)) {
+            TextButton(onClick = { export(files) }, enabled = files.isNotEmpty()) {
+                Text("Exportar todos para a galeria")
+            }
+        }
+        info?.let {
+            Text(
+                it, Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+                color = MaterialTheme.colorScheme.primary,
+                style = MaterialTheme.typography.bodySmall
+            )
         }
         LazyColumn(Modifier.fillMaxSize()) {
             items(files, key = { it.name }) { f ->
@@ -351,23 +500,26 @@ fun VaultScreen(onBack: () -> Unit) {
                             contentAlignment = Alignment.Center
                         ) { Text("MP4") }
                     }
-                    Column(Modifier.weight(1f).padding(horizontal = 12.dp)) {
+                    Column(Modifier.weight(1f).padding(start = 12.dp)) {
                         Text(f.name)
                         Text(
                             "%.1f MB".format(f.length() / 1_048_576f),
                             style = MaterialTheme.typography.bodySmall
                         )
+                        Row {
+                            TextButton(onClick = { export(listOf(f)) }) { Text("Galeria") }
+                            TextButton(onClick = {
+                                val uri = Vault.export(ctx, f)
+                                val mime = if (isPhoto) "image/jpeg" else "video/mp4"
+                                val i = Intent(Intent.ACTION_SEND)
+                                    .setType(mime)
+                                    .putExtra(Intent.EXTRA_STREAM, uri)
+                                    .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                ctx.startActivity(Intent.createChooser(i, null))
+                            }) { Text("Enviar") }
+                            TextButton(onClick = { del = f }) { Text("Apagar") }
+                        }
                     }
-                    TextButton(onClick = {
-                        val uri = Vault.export(ctx, f)
-                        val mime = if (isPhoto) "image/jpeg" else "video/mp4"
-                        val i = Intent(Intent.ACTION_SEND)
-                            .setType(mime)
-                            .putExtra(Intent.EXTRA_STREAM, uri)
-                            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                        ctx.startActivity(Intent.createChooser(i, null))
-                    }) { Text("Enviar") }
-                    TextButton(onClick = { del = f }) { Text("Apagar") }
                 }
                 HorizontalDivider()
             }
@@ -451,6 +603,10 @@ fun CleanScreen(incoming: MutableState<List<Uri>>, busyState: MutableState<Boole
     var saving by remember { mutableStateOf<File?>(null) }
     var info by remember { mutableStateOf<String?>(null) }
     val busy = busyState.value
+    val export = rememberGalleryExporter { msg ->
+        info = msg
+        cleaned = Cleaner.list(ctx)
+    }
 
     fun add(l: List<Uri>) {
         val have = picked.map { it.uri }.toSet()
@@ -623,6 +779,11 @@ fun CleanScreen(incoming: MutableState<List<Uri>>, busyState: MutableState<Boole
                     )
                     Row {
                         TextButton(onClick = { shareFiles(ctx, cleaned) }) { Text("Enviar todos") }
+                        TextButton(onClick = { export(cleaned) }, enabled = !busy) {
+                            Text("Galeria (todos)")
+                        }
+                    }
+                    Row {
                         TextButton(
                             onClick = {
                                 val all = cleaned
@@ -642,10 +803,11 @@ fun CleanScreen(incoming: MutableState<List<Uri>>, busyState: MutableState<Boole
                     Text(mb(f.length()), style = MaterialTheme.typography.bodySmall)
                     Row {
                         TextButton(onClick = { shareFiles(ctx, listOf(f)) }) { Text("Enviar") }
+                        TextButton(onClick = { export(listOf(f)) }, enabled = !busy) { Text("Galeria") }
                         TextButton(onClick = {
                             saving = f
                             saver.launch(f.name)
-                        }) { Text("Salvar em...") }
+                        }) { Text("Salvar") }
                         TextButton(
                             onClick = {
                                 scope.launch {
