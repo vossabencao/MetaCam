@@ -11,5 +11,5 @@ dependencyResolutionManagement {
         mavenCentral()
     }
 }
-rootProject.name = "GhostCam"
+rootProject.name = "MetaCam"
 include(":app")
