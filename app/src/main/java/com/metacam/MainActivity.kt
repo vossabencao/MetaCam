@@ -1,824 +1,708 @@
-package com.metacam
+package com.milk.audiobook
 
 import android.Manifest
-import android.annotation.SuppressLint
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.provider.OpenableColumns
-import android.view.WindowManager
-import android.webkit.MimeTypeMap
+import android.os.Environment
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
-import androidx.activity.result.contract.ActivityResultContracts
-import androidx.camera.core.CameraSelector
-import androidx.camera.core.ImageCapture
-import androidx.camera.core.ImageCaptureException
-import androidx.camera.core.ImageProxy
-import androidx.camera.core.Preview
-import androidx.camera.lifecycle.ProcessCameraProvider
-import androidx.camera.video.FallbackStrategy
-import androidx.camera.video.FileOutputOptions
-import androidx.camera.video.Quality
-import androidx.camera.video.QualitySelector
-import androidx.camera.video.Recorder
-import androidx.camera.video.Recording
-import androidx.camera.video.VideoCapture
-import androidx.camera.video.VideoRecordEvent
-import androidx.camera.view.PreviewView
-import androidx.compose.foundation.Image
-import androidx.compose.foundation.background
+import androidx.activity.result.contract.ActivityResultContracts.RequestPermission
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Headphones
+import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Pause
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
-import androidx.core.content.IntentCompat
-import androidx.lifecycle.compose.LocalLifecycleOwner
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LifecycleEventEffect
+import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.media3.common.C
+import androidx.media3.common.Player
+import androidx.media3.session.MediaController
+import kotlinx.coroutines.delay
 import java.io.File
-import java.util.concurrent.Executors
 
 class MainActivity : ComponentActivity() {
-    private val incoming = mutableStateOf<List<Uri>>(emptyList())
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        window.setFlags(
-            WindowManager.LayoutParams.FLAG_SECURE,
-            WindowManager.LayoutParams.FLAG_SECURE
-        )
-        Vault.clearExports(this)
-        takeShared(intent)
         setContent {
-            MaterialTheme(
-                colorScheme = darkColorScheme(background = Color.Black, surface = Color.Black)
-            ) { Root(incoming) }
+            var amoled by remember { mutableStateOf(Store.amoled(this@MainActivity)) }
+            val scheme = if (amoled) {
+                darkColorScheme(
+                    background = Color.Black,
+                    surface = Color.Black,
+                    surfaceTint = Color.Black,
+                    surfaceContainer = Color.Black,
+                    surfaceContainerHigh = Color(0xFF121212),
+                    surfaceContainerHighest = Color(0xFF1A1A1A)
+                )
+            } else {
+                darkColorScheme()
+            }
+            SideEffect {
+                val bar = if (amoled) Color.Black else Color(0xFF1C1B1F)
+                window.statusBarColor = bar.toArgb()
+                window.navigationBarColor = bar.toArgb()
+            }
+            MaterialTheme(colorScheme = scheme) {
+                App(amoled = amoled, onAmoled = {
+                    amoled = it
+                    Store.setAmoled(this@MainActivity, it)
+                })
+            }
         }
-    }
-
-    override fun onNewIntent(intent: Intent) {
-        super.onNewIntent(intent)
-        setIntent(intent)
-        takeShared(intent)
-    }
-
-    private fun takeShared(i: Intent?) {
-        if (i == null) return
-        val list: List<Uri> = when (i.action) {
-            Intent.ACTION_SEND ->
-                listOfNotNull(IntentCompat.getParcelableExtra(i, Intent.EXTRA_STREAM, Uri::class.java))
-            Intent.ACTION_SEND_MULTIPLE ->
-                IntentCompat.getParcelableArrayListExtra(i, Intent.EXTRA_STREAM, Uri::class.java)
-                    ?: emptyList()
-            else -> emptyList()
-        }
-        if (list.isNotEmpty()) incoming.value = list
     }
 }
 
-@Composable
-fun Root(incoming: MutableState<List<Uri>>) {
-    var tab by remember { mutableIntStateOf(if (incoming.value.isNotEmpty()) 1 else 0) }
-    val busy = remember { mutableStateOf(false) }
+private fun hasAccess(ctx: Context): Boolean =
+    if (Build.VERSION.SDK_INT >= 30) Environment.isExternalStorageManager()
+    else ContextCompat.checkSelfPermission(
+        ctx, Manifest.permission.READ_EXTERNAL_STORAGE
+    ) == PackageManager.PERMISSION_GRANTED
 
-    LaunchedEffect(incoming.value) { if (incoming.value.isNotEmpty()) tab = 1 }
+private fun fmt(ms: Long): String {
+    val s = ms / 1000
+    return "%d:%02d:%02d".format(s / 3600, (s % 3600) / 60, s % 60)
+}
+
+private fun playAudioOnly(holder: PlayerHolder, list: List<Book>, start: Int) {
+    holder.controller?.let {
+        it.trackSelectionParameters = it.trackSelectionParameters.buildUpon()
+            .setTrackTypeDisabled(C.TRACK_TYPE_VIDEO, true)
+            .build()
+    }
+    holder.playQueue(list, start)
+}
+
+private sealed interface Dlg {
+    class Rename(val b: Book) : Dlg
+    class Delete(val b: Book) : Dlg
+    class AddTo(val b: Book) : Dlg
+    class Pick(val b: Book, val move: Boolean) : Dlg
+    class NewPlaylistFor(val b: Book) : Dlg
+    class DeletePlaylist(val name: String) : Dlg
+    object NewPlaylist : Dlg
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun App(amoled: Boolean, onAmoled: (Boolean) -> Unit, vm: LibraryViewModel = viewModel()) {
+    val ctx = LocalContext.current
+    var access by remember { mutableStateOf(hasAccess(ctx)) }
+    var tab by remember { mutableIntStateOf(0) }
+    var dlg by remember { mutableStateOf<Dlg?>(null) }
+    var openList by remember { mutableStateOf<String?>(null) }
+    val snack = remember { SnackbarHostState() }
+
+    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
+        access = hasAccess(ctx)
+        vm.refresh()
+    }
+
+    val legacyLauncher = rememberLauncherForActivityResult(RequestPermission()) { access = it }
+    val notifLauncher = rememberLauncherForActivityResult(RequestPermission()) { }
+
+    LaunchedEffect(Unit) {
+        if (Build.VERSION.SDK_INT >= 33) notifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+    }
+    LaunchedEffect(access) { if (access) vm.scanAll() }
+    LaunchedEffect(vm.message) {
+        val m = vm.message
+        if (m != null) {
+            snack.showSnackbar(m)
+            vm.message = null
+        }
+    }
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(3000)
+            vm.refresh()
+        }
+    }
+
+    val holder = remember { PlayerHolder(ctx) }
+    DisposableEffect(Unit) { onDispose { holder.release() } }
+
+    Dialogs(dlg, { dlg = it }, vm, holder)
 
     Scaffold(
-        bottomBar = {
-            NavigationBar {
-                NavigationBarItem(
-                    selected = tab == 0,
-                    enabled = !busy.value,
-                    onClick = { tab = 0 },
-                    icon = { Box(Modifier.size(1.dp)) },
-                    label = { Text("Câmera") }
-                )
-                NavigationBarItem(
-                    selected = tab == 1,
-                    onClick = { tab = 1 },
-                    icon = { Box(Modifier.size(1.dp)) },
-                    label = { Text("Limpeza") }
-                )
-                NavigationBarItem(
-                    selected = tab == 2,
-                    enabled = !busy.value,
-                    onClick = { tab = 2 },
-                    icon = { Box(Modifier.size(1.dp)) },
-                    label = { Text("Config") }
-                )
-            }
-        }
-    ) { pad ->
-        Box(Modifier.padding(pad).fillMaxSize()) {
-            when (tab) {
-                0 -> CameraTab()
-                1 -> CleanScreen(incoming, busy)
-                else -> SettingsScreen()
-            }
-        }
-    }
-}
-
-// ---------------- Exportar para a galeria ----------------
-
-@Composable
-fun rememberGalleryExporter(onDone: (String) -> Unit): (List<File>) -> Unit {
-    val ctx = LocalContext.current
-    val scope = rememberCoroutineScope()
-    var pending by remember { mutableStateOf<List<File>>(emptyList()) }
-
-    fun run(list: List<File>) {
-        scope.launch {
-            val delAfter = Prefs.deleteAfterExport(ctx)
-            val r = withContext(Dispatchers.IO) {
-                var ok = 0
-                var fail = 0
-                var removed = 0
-                for (f in list) {
-                    if (Gallery.export(ctx, f).isSuccess) {
-                        ok++
-                        if (delAfter) {
-                            Vault.wipe(f)
-                            removed++
-                        }
-                    } else {
-                        fail++
+        snackbarHost = { SnackbarHost(snack) },
+        topBar = {
+            TopAppBar(
+                title = { Text("AVI") },
+                actions = {
+                    IconButton(onClick = { if (access) vm.scanAll() }) {
+                        Icon(Icons.Filled.Refresh, contentDescription = "Reescanear")
                     }
                 }
-                Triple(ok, fail, removed)
-            }
-            var msg = if (r.first == 0) "Nada foi exportado" else "${r.first} exportado(s) para a galeria"
-            if (r.third > 0) msg += ", ${r.third} apagado(s) do app"
-            if (r.second > 0) msg += ", ${r.second} falhou(aram)"
-            onDone(msg)
+            )
+        },
+        bottomBar = {
+            val c = holder.controller
+            if (holder.active && c != null) PlayerBar(c)
         }
-    }
+    ) { pad ->
+        Column(Modifier.padding(pad).fillMaxSize()) {
+            if (!access) {
+                Column(
+                    Modifier.fillMaxSize().padding(24.dp),
+                    verticalArrangement = Arrangement.Center,
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Text("Precisa de acesso a todos os arquivos para varrer o armazenamento.")
+                    Spacer(Modifier.height(16.dp))
+                    Button(onClick = {
+                        if (Build.VERSION.SDK_INT >= 30) {
+                            ctx.startActivity(
+                                Intent(
+                                    Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                                    Uri.parse("package:${ctx.packageName}")
+                                )
+                            )
+                        } else legacyLauncher.launch(Manifest.permission.READ_EXTERNAL_STORAGE)
+                    }) { Text("Conceder acesso") }
+                }
+                return@Column
+            }
 
-    val perm = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { ok ->
-        val l = pending
-        pending = emptyList()
-        if (ok) run(l) else onDone("Permissão de armazenamento negada")
-    }
-
-    return { list ->
-        if (list.isNotEmpty()) {
-            if (Build.VERSION.SDK_INT <= 28 &&
-                ContextCompat.checkSelfPermission(
-                    ctx, Manifest.permission.WRITE_EXTERNAL_STORAGE
-                ) != PackageManager.PERMISSION_GRANTED
-            ) {
-                pending = list
-                perm.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
-            } else {
-                run(list)
+            TabRow(selectedTabIndex = tab) {
+                Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text("Áudios") })
+                Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("Playlists") })
+                Tab(selected = tab == 2, onClick = { tab = 2 }, text = { Text("Vídeos") })
+                Tab(selected = tab == 3, onClick = { tab = 3 }, text = { Text("Config") })
+            }
+            when (tab) {
+                0 -> LibraryTab(vm, holder) { dlg = it }
+                1 -> PlaylistsTab(vm, holder, openList, { openList = it }) { dlg = it }
+                2 -> VideosTab(vm, holder) { dlg = it }
+                else -> SettingsTab(amoled, onAmoled)
             }
         }
     }
 }
 
-// ---------------- Configurações ----------------
+@Composable
+private fun SettingsTab(amoled: Boolean, onAmoled: (Boolean) -> Unit) {
+    Column(Modifier.fillMaxSize().padding(16.dp)) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("Tema AMOLED", style = MaterialTheme.typography.bodyLarge)
+                Text("Fundo preto puro (#000000)", style = MaterialTheme.typography.bodySmall)
+            }
+            Switch(checked = amoled, onCheckedChange = onAmoled)
+        }
+        HorizontalDivider(Modifier.padding(vertical = 16.dp))
+        Text("AVI - Audiobook + Video Integrated", style = MaterialTheme.typography.bodyLarge)
+        Spacer(Modifier.height(4.dp))
+        Text(
+            "Player de vídeo inspirado no One Player (Apache 2.0, Zakir Sheikh).",
+            style = MaterialTheme.typography.bodySmall
+        )
+    }
+}
 
 @Composable
-fun SettingsScreen() {
+private fun VideosTab(vm: LibraryViewModel, holder: PlayerHolder, show: (Dlg) -> Unit) {
     val ctx = LocalContext.current
-    var del by remember { mutableStateOf(Prefs.deleteAfterExport(ctx)) }
+    var query by remember { mutableStateOf("") }
+    val tick = vm.tick
 
-    Column(
-        Modifier.fillMaxSize().statusBarsPadding()
-            .verticalScroll(rememberScrollState()).padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
-    ) {
-        Text("Configurações", style = MaterialTheme.typography.headlineSmall)
+    Column(Modifier.fillMaxSize()) {
+        OutlinedTextField(
+            value = query,
+            onValueChange = { query = it },
+            label = { Text("Buscar vídeos") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp)
+        )
+        if (vm.scanningV) {
+            LinearProgressIndicator(Modifier.fillMaxWidth())
+            Text("${vm.videos.size} encontrados...", Modifier.padding(12.dp))
+        } else {
+            Text("${vm.videos.size} vídeos", Modifier.padding(12.dp))
+        }
 
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Column(Modifier.weight(1f)) {
-                Text("Apagar do app após exportar", style = MaterialTheme.typography.bodyLarge)
+        val shown = vm.videos.filter {
+            query.isBlank() || it.title.contains(query, true) || it.folder.contains(query, true)
+        }
+        LazyColumn(Modifier.fillMaxSize()) {
+            itemsIndexed(shown, key = { _, b -> b.path }) { i, b ->
+                val open: () -> Unit = {
+                    holder.controller?.pause()
+                    ctx.startActivity(Intent(ctx, VideoActivity::class.java).putExtra("path", b.path))
+                }
+                val actions: List<Pair<String, () -> Unit>> = listOf(
+                    "Reproduzir" to open,
+                    "Renomear" to { show(Dlg.Rename(b)) },
+                    "Mover" to { show(Dlg.Pick(b, true)) },
+                    "Copiar" to { show(Dlg.Pick(b, false)) },
+                    "Excluir" to { show(Dlg.Delete(b)) }
+                )
+                BookRow(
+                    b, tick, actions,
+                    extra = {
+                        IconButton(onClick = { playAudioOnly(holder, shown, i) }) {
+                            Icon(Icons.Filled.Headphones, contentDescription = "Tocar como áudio")
+                        }
+                    }
+                ) { open() }
+            }
+        }
+    }
+}
+
+@Composable
+private fun LibraryTab(vm: LibraryViewModel, holder: PlayerHolder, show: (Dlg) -> Unit) {
+    val ctx = LocalContext.current
+    var query by remember { mutableStateOf("") }
+    val tick = vm.tick
+    val last = remember(tick) { Store.last(ctx)?.let { vm.bookOf(it) } }
+
+    Column(Modifier.fillMaxSize()) {
+        OutlinedTextField(
+            value = query,
+            onValueChange = { query = it },
+            label = { Text("Buscar") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp)
+        )
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Switch(checked = vm.onlyLong, onCheckedChange = { vm.onlyLong = it; vm.scan() })
+            Spacer(Modifier.width(8.dp))
+            Text("Ocultar áudios curtos (< 5 MB)", Modifier.weight(1f))
+        }
+        if (!holder.active && last != null) {
+            OutlinedButton(
+                onClick = { holder.play(last) },
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp)
+            ) {
+                Text("Continuar: ${last.title}")
+            }
+        }
+        if (vm.scanning) {
+            LinearProgressIndicator(Modifier.fillMaxWidth())
+            Text("${vm.books.size} encontrados...", Modifier.padding(12.dp))
+        } else {
+            Text("${vm.books.size} áudios", Modifier.padding(12.dp))
+        }
+
+        val shown = vm.books.filter {
+            query.isBlank() || it.title.contains(query, true) || it.folder.contains(query, true)
+        }
+        LazyColumn(Modifier.fillMaxSize()) {
+            items(shown, key = { it.path }) { b ->
+                val actions: List<Pair<String, () -> Unit>> = listOf(
+                    "Tocar" to { holder.play(b) },
+                    "Adicionar à playlist" to { show(Dlg.AddTo(b)) },
+                    "Renomear" to { show(Dlg.Rename(b)) },
+                    "Mover" to { show(Dlg.Pick(b, true)) },
+                    "Copiar" to { show(Dlg.Pick(b, false)) },
+                    "Excluir" to { show(Dlg.Delete(b)) }
+                )
+                BookRow(b, tick, actions) { holder.play(b) }
+            }
+        }
+    }
+}
+
+@Composable
+private fun PlaylistsTab(
+    vm: LibraryViewModel,
+    holder: PlayerHolder,
+    open: String?,
+    setOpen: (String?) -> Unit,
+    show: (Dlg) -> Unit
+) {
+    val tick = vm.tick
+    val pl = vm.playlists.firstOrNull { it.name == open }
+    LaunchedEffect(open, pl) { if (open != null && pl == null) setOpen(null) }
+
+    if (pl == null) {
+        Column(Modifier.fillMaxSize()) {
+            Button(
+                onClick = { show(Dlg.NewPlaylist) },
+                modifier = Modifier.fillMaxWidth().padding(12.dp)
+            ) { Text("Nova playlist") }
+            if (vm.playlists.isEmpty()) {
                 Text(
-                    "Depois de exportar para a galeria com sucesso, o arquivo é sobrescrito " +
-                        "e excluído do cofre e da lista de arquivos limpos. Se a exportação " +
-                        "falhar, nada é apagado.",
-                    style = MaterialTheme.typography.bodySmall
+                    "Nenhuma playlist. Crie uma e adicione áudios pelo menu ⋮ da biblioteca.",
+                    Modifier.padding(16.dp)
                 )
             }
-            Spacer(Modifier.width(8.dp))
-            Switch(
-                checked = del,
-                onCheckedChange = {
-                    del = it
-                    Prefs.setDeleteAfterExport(ctx, it)
+            LazyColumn(Modifier.fillMaxSize()) {
+                items(vm.playlists, key = { it.name }) { p ->
+                    Column(
+                        Modifier.fillMaxWidth().clickable { setOpen(p.name) }
+                            .padding(horizontal = 16.dp, vertical = 12.dp)
+                    ) {
+                        Text(p.name, style = MaterialTheme.typography.bodyLarge)
+                        Text("${p.items.size} áudios", style = MaterialTheme.typography.bodySmall)
+                    }
+                    HorizontalDivider()
                 }
+            }
+        }
+        return
+    }
+
+    val list = remember(pl.items, vm.books.size, tick) { pl.items.mapNotNull { vm.bookOf(it) } }
+    Column(Modifier.fillMaxSize()) {
+        Row(Modifier.fillMaxWidth().padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            TextButton(onClick = { setOpen(null) }) { Text("< Voltar") }
+            Text(
+                pl.name, Modifier.weight(1f),
+                style = MaterialTheme.typography.titleMedium
             )
         }
-
-        HorizontalDivider()
-
-        Text("Onde ficam os arquivos exportados", style = MaterialTheme.typography.titleMedium)
-        Text("Fotos: Pictures/MetaCam", style = MaterialTheme.typography.bodySmall)
-        Text("Vídeos: Movies/MetaCam", style = MaterialTheme.typography.bodySmall)
-        Text("Áudios: Music/MetaCam", style = MaterialTheme.typography.bodySmall)
-        Text(
-            "PDF e documentos: Download/MetaCam (não aparecem na galeria)",
-            style = MaterialTheme.typography.bodySmall
-        )
-
-        HorizontalDivider()
-
-        Text("Atenção", style = MaterialTheme.typography.titleMedium)
-        Text(
-            "Na galeria, o arquivo deixa de ser privado. Apps com acesso a fotos e vídeos " +
-                "conseguem lê-lo, e a galeria ou o backup em nuvem do aparelho pode enviá-lo. " +
-                "A data de exibição será a de hoje, e não a original.",
-            style = MaterialTheme.typography.bodySmall
-        )
-    }
-}
-
-// ---------------- Câmera ----------------
-
-@Composable
-fun CameraTab() {
-    val ctx = LocalContext.current
-    var cam by remember {
-        mutableStateOf(
-            ContextCompat.checkSelfPermission(ctx, Manifest.permission.CAMERA) ==
-                PackageManager.PERMISSION_GRANTED
-        )
-    }
-    val launcher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { cam = it }
-    var vault by remember { mutableStateOf(false) }
-
-    LaunchedEffect(Unit) { if (!cam) launcher.launch(Manifest.permission.CAMERA) }
-
-    if (!cam) {
-        Column(
-            Modifier.fillMaxSize().padding(24.dp),
-            verticalArrangement = Arrangement.Center,
-            horizontalAlignment = Alignment.CenterHorizontally
+        Row(
+            Modifier.padding(horizontal = 12.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            Text("O app precisa da câmera.")
-            Spacer(Modifier.height(16.dp))
-            Button(onClick = { launcher.launch(Manifest.permission.CAMERA) }) { Text("Conceder") }
+            Button(onClick = { holder.playQueue(list, 0) }, enabled = list.isNotEmpty()) {
+                Text("Tocar tudo")
+            }
+            OutlinedButton(onClick = { show(Dlg.DeletePlaylist(pl.name)) }) {
+                Text("Excluir playlist")
+            }
         }
-    } else if (vault) {
-        VaultScreen { vault = false }
-    } else {
-        CameraScreen { vault = true }
+        if (list.isEmpty()) {
+            Text("Vazia. Adicione áudios pelo menu ⋮ da biblioteca.", Modifier.padding(16.dp))
+        }
+        LazyColumn(Modifier.fillMaxSize()) {
+            itemsIndexed(list, key = { _, b -> b.path }) { i, b ->
+                val actions: List<Pair<String, () -> Unit>> = listOf(
+                    "Remover da playlist" to { vm.removeFromPlaylist(pl.name, b.path) }
+                )
+                BookRow(b, tick, actions) { holder.playQueue(list, i) }
+            }
+        }
     }
 }
 
-@SuppressLint("MissingPermission")
 @Composable
-fun CameraScreen(onVault: () -> Unit) {
+private fun BookRow(
+    b: Book,
+    tick: Int,
+    actions: List<Pair<String, () -> Unit>>,
+    extra: (@Composable () -> Unit)? = null,
+    onClick: () -> Unit
+) {
     val ctx = LocalContext.current
-    val owner = LocalLifecycleOwner.current
-    val main = remember { ContextCompat.getMainExecutor(ctx) }
-    val worker = remember { Executors.newSingleThreadExecutor() }
+    val progress = remember(tick, b.path) { Store.progress(ctx, b.path) }
+    var menu by remember { mutableStateOf(false) }
 
-    var lens by remember { mutableIntStateOf(CameraSelector.LENS_FACING_BACK) }
-    var audio by remember { mutableStateOf(false) }
-    var recording by remember { mutableStateOf<Recording?>(null) }
-    var msg by remember { mutableStateOf<String?>(null) }
-
-    val imageCapture = remember { ImageCapture.Builder().build() }
-    val videoCapture = remember {
-        VideoCapture.withOutput(
-            Recorder.Builder()
-                .setQualitySelector(
-                    QualitySelector.from(
-                        Quality.FHD,
-                        FallbackStrategy.lowerQualityOrHigherThan(Quality.SD)
-                    )
+    Row(
+        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(start = 16.dp, top = 6.dp, bottom = 6.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(
+                b.title,
+                style = MaterialTheme.typography.bodyLarge
+            )
+            val pct = if (progress > 0f) " • ${(progress * 100).toInt()}%" else ""
+            Text(
+                "${b.folder} • " + "%.1f MB".format(b.sizeMb) + pct,
+                style = MaterialTheme.typography.bodySmall
+            )
+            if (progress > 0f) {
+                LinearProgressIndicator(
+                    progress = { progress },
+                    modifier = Modifier.fillMaxWidth().padding(top = 4.dp, end = 8.dp)
                 )
-                .build()
-        )
-    }
-    val previewView = remember { PreviewView(ctx) }
-
-    val audioPerm = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { audio = it }
-
-    DisposableEffect(Unit) {
-        onDispose {
-            recording?.stop()
-            try {
-                ProcessCameraProvider.getInstance(ctx).get().unbindAll()
-            } catch (e: Exception) {
             }
         }
-    }
-
-    LaunchedEffect(lens) {
-        val future = ProcessCameraProvider.getInstance(ctx)
-        future.addListener({
-            val provider = future.get()
-            val preview = Preview.Builder().build()
-                .also { it.setSurfaceProvider(previewView.surfaceProvider) }
-            try {
-                provider.unbindAll()
-                provider.bindToLifecycle(
-                    owner,
-                    CameraSelector.Builder().requireLensFacing(lens).build(),
-                    preview, imageCapture, videoCapture
-                )
-            } catch (e: Exception) {
-                msg = "Falha ao abrir a câmera"
+        extra?.invoke()
+        Box {
+            IconButton(onClick = { menu = true }) {
+                Icon(Icons.Filled.MoreVert, contentDescription = "Opções")
             }
-        }, main)
-    }
-
-    fun takePhoto() {
-        imageCapture.takePicture(worker, object : ImageCapture.OnImageCapturedCallback() {
-            override fun onCaptureSuccess(image: ImageProxy) {
-                val ok = try {
-                    Vault.savePhoto(ctx, image)
-                } catch (e: Exception) {
-                    false
-                } finally {
-                    image.close()
+            DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                actions.forEach { (label, act) ->
+                    DropdownMenuItem(text = { Text(label) }, onClick = { menu = false; act() })
                 }
-                main.execute { msg = if (ok) "Foto salva no cofre" else "Falha ao salvar" }
             }
+        }
+    }
+    HorizontalDivider()
+}
 
-            override fun onError(exception: ImageCaptureException) {
-                main.execute { msg = "Falha ao capturar" }
+@Composable
+private fun Dialogs(dlg: Dlg?, set: (Dlg?) -> Unit, vm: LibraryViewModel, holder: PlayerHolder) {
+    val close: () -> Unit = { set(null) }
+    when (dlg) {
+        null -> Unit
+
+        is Dlg.Rename -> TextDialog("Renomear", dlg.b.title, "Novo nome", close) { name ->
+            holder.stopIfUsing(dlg.b.path)
+            vm.rename(dlg.b, name)
+            close()
+        }
+
+        is Dlg.NewPlaylist -> TextDialog("Nova playlist", "", "Nome", close) { name ->
+            vm.createPlaylist(name)
+            close()
+        }
+
+        is Dlg.NewPlaylistFor -> TextDialog("Nova playlist", "", "Nome", close) { name ->
+            vm.createPlaylist(name, dlg.b.path)
+            close()
+        }
+
+        is Dlg.DeletePlaylist -> AlertDialog(
+            onDismissRequest = close,
+            title = { Text("Excluir playlist?") },
+            text = { Text("\"${dlg.name}\" será removida. Os áudios continuam no aparelho.") },
+            confirmButton = {
+                TextButton(onClick = { vm.deletePlaylist(dlg.name); close() }) { Text("Excluir") }
+            },
+            dismissButton = { TextButton(onClick = close) { Text("Cancelar") } }
+        )
+
+        is Dlg.Delete -> AlertDialog(
+            onDismissRequest = close,
+            title = { Text("Excluir arquivo?") },
+            text = { Text("\"${dlg.b.title}\" será apagado do aparelho. Não dá para desfazer.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    holder.stopIfUsing(dlg.b.path)
+                    vm.delete(dlg.b)
+                    close()
+                }) { Text("Excluir") }
+            },
+            dismissButton = { TextButton(onClick = close) { Text("Cancelar") } }
+        )
+
+        is Dlg.AddTo -> AlertDialog(
+            onDismissRequest = close,
+            title = { Text("Adicionar à playlist") },
+            text = {
+                LazyColumn(Modifier.heightIn(max = 320.dp)) {
+                    item {
+                        Text(
+                            "+ Nova playlist",
+                            Modifier.fillMaxWidth().clickable { set(Dlg.NewPlaylistFor(dlg.b)) }.padding(12.dp),
+                            style = MaterialTheme.typography.bodyLarge
+                        )
+                    }
+                    items(vm.playlists, key = { it.name }) { p ->
+                        Text(
+                            p.name,
+                            Modifier.fillMaxWidth().clickable {
+                                vm.addToPlaylist(p.name, dlg.b.path)
+                                close()
+                            }.padding(12.dp),
+                            style = MaterialTheme.typography.bodyLarge
+                        )
+                    }
+                }
+            },
+            confirmButton = { TextButton(onClick = close) { Text("Cancelar") } }
+        )
+
+        is Dlg.Pick -> FolderPicker(
+            title = if (dlg.move) "Mover para..." else "Copiar para...",
+            start = File(dlg.b.path).parentFile ?: Environment.getExternalStorageDirectory(),
+            onDismiss = close
+        ) { dir ->
+            if (dlg.move) {
+                holder.stopIfUsing(dlg.b.path)
+                vm.move(dlg.b, dir)
+            } else {
+                vm.copy(dlg.b, dir)
             }
-        })
+            close()
+        }
+    }
+}
+
+@Composable
+private fun TextDialog(
+    title: String,
+    initial: String,
+    label: String,
+    onDismiss: () -> Unit,
+    onOk: (String) -> Unit
+) {
+    var text by remember { mutableStateOf(initial) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = {
+            OutlinedTextField(
+                value = text,
+                onValueChange = { text = it },
+                label = { Text(label) },
+                singleLine = true
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = { onOk(text) }, enabled = text.isNotBlank()) { Text("OK") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancelar") } }
+    )
+}
+
+@Composable
+private fun FolderPicker(title: String, start: File, onDismiss: () -> Unit, onPick: (File) -> Unit) {
+    var dir by remember { mutableStateOf(start) }
+    var creating by remember { mutableStateOf(false) }
+    val subs = remember(dir) { FileOps.subdirs(dir) }
+
+    if (creating) {
+        TextDialog("Nova pasta", "", "Nome da pasta", { creating = false }) { n ->
+            FileOps.mkdir(dir, n)?.let { dir = it }
+            creating = false
+        }
     }
 
-    fun startRec() {
-        val file = Vault.newFile(ctx, "mp4")
-        var prep = videoCapture.output.prepareRecording(ctx, FileOutputOptions.Builder(file).build())
-        if (audio && ContextCompat.checkSelfPermission(ctx, Manifest.permission.RECORD_AUDIO) ==
-            PackageManager.PERMISSION_GRANTED
-        ) {
-            prep = prep.withAudioEnabled()
-        }
-        recording = prep.start(main) { ev ->
-            if (ev is VideoRecordEvent.Finalize) {
-                recording = null
-                if (ev.hasError()) {
-                    file.delete()
-                    msg = "Gravação falhou"
-                } else {
-                    msg = "Limpando metadados..."
-                    Thread {
-                        try {
-                            MetaScrub.scrubMp4(file)
-                            file.setLastModified(0L)
-                            main.execute { msg = "Vídeo salvo no cofre" }
-                        } catch (e: Exception) {
-                            main.execute { msg = "Vídeo salvo, falha na limpeza" }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = {
+            Column {
+                Text(dir.absolutePath, style = MaterialTheme.typography.bodySmall)
+                Spacer(Modifier.height(8.dp))
+                LazyColumn(Modifier.heightIn(max = 320.dp)) {
+                    val up = dir.parentFile
+                    if (up != null && up.canRead()) {
+                        item {
+                            Text(
+                                ".. (subir)",
+                                Modifier.fillMaxWidth().clickable { dir = up }.padding(12.dp)
+                            )
                         }
-                    }.start()
+                    }
+                    items(subs, key = { it.absolutePath }) { f ->
+                        Text(
+                            f.name + "/",
+                            Modifier.fillMaxWidth().clickable { dir = f }.padding(12.dp)
+                        )
+                    }
                 }
             }
+        },
+        confirmButton = { TextButton(onClick = { onPick(dir) }) { Text("Escolher esta pasta") } },
+        dismissButton = {
+            Row {
+                TextButton(onClick = { creating = true }) { Text("Nova pasta") }
+                TextButton(onClick = onDismiss) { Text("Cancelar") }
+            }
         }
+    )
+}
+
+@Composable
+fun PlayerBar(c: MediaController) {
+    val ctx = LocalContext.current
+    var playing by remember { mutableStateOf(c.isPlaying) }
+    var pos by remember { mutableLongStateOf(c.currentPosition) }
+    var dur by remember { mutableLongStateOf(c.duration.coerceAtLeast(0L)) }
+    var title by remember { mutableStateOf(c.mediaMetadata.title?.toString() ?: "") }
+    var speed by remember { mutableFloatStateOf(c.playbackParameters.speed) }
+    var repeat by remember { mutableIntStateOf(c.repeatMode) }
+    var count by remember { mutableIntStateOf(c.mediaItemCount) }
+
+    DisposableEffect(c) {
+        val l = object : Player.Listener {
+            override fun onIsPlayingChanged(isPlaying: Boolean) { playing = isPlaying }
+            override fun onEvents(p: Player, e: Player.Events) {
+                dur = p.duration.coerceAtLeast(0L)
+                title = p.mediaMetadata.title?.toString() ?: ""
+                speed = p.playbackParameters.speed
+                repeat = p.repeatMode
+                count = p.mediaItemCount
+            }
+        }
+        c.addListener(l)
+        onDispose { c.removeListener(l) }
     }
 
-    Box(Modifier.fillMaxSize()) {
-        AndroidView(factory = { previewView }, modifier = Modifier.fillMaxSize())
-        Column(
-            Modifier.align(Alignment.BottomCenter).fillMaxWidth()
-                .background(Color(0x99000000)).padding(12.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            msg?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+    LaunchedEffect(c, playing) {
+        do {
+            pos = c.currentPosition
+            if (playing) delay(1000)
+        } while (playing)
+    }
+
+    Surface(tonalElevation = 6.dp) {
+        Column(Modifier.fillMaxWidth().padding(12.dp)) {
+            Text(title)
+            Slider(
+                value = pos.toFloat().coerceIn(0f, maxOf(dur, 1L).toFloat()),
+                onValueChange = { pos = it.toLong() },
+                onValueChangeFinished = { c.seekTo(pos) },
+                valueRange = 0f..maxOf(dur, 1L).toFloat()
+            )
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Text(fmt(pos), style = MaterialTheme.typography.bodySmall)
+                Text(fmt(dur), style = MaterialTheme.typography.bodySmall)
+            }
             Row(
                 Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceEvenly,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                TextButton(onClick = onVault) { Text("Cofre") }
-                Button(onClick = { takePhoto() }, enabled = recording == null) { Text("Foto") }
-                Button(onClick = {
-                    val r = recording
-                    if (r != null) r.stop() else startRec()
-                }) { Text(if (recording != null) "Parar" else "Gravar") }
-                TextButton(
-                    onClick = {
-                        lens = if (lens == CameraSelector.LENS_FACING_BACK)
-                            CameraSelector.LENS_FACING_FRONT else CameraSelector.LENS_FACING_BACK
-                    },
-                    enabled = recording == null
-                ) { Text("Virar") }
-            }
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Switch(
-                    checked = audio,
-                    onCheckedChange = { on ->
-                        if (!on) audio = false
-                        else if (ContextCompat.checkSelfPermission(
-                                ctx, Manifest.permission.RECORD_AUDIO
-                            ) == PackageManager.PERMISSION_GRANTED
-                        ) audio = true
-                        else audioPerm.launch(Manifest.permission.RECORD_AUDIO)
-                    },
-                    enabled = recording == null
-                )
-                Spacer(Modifier.width(8.dp))
-                Text("Gravar áudio nos vídeos")
-            }
-        }
-    }
-}
-
-@Composable
-fun VaultScreen(onBack: () -> Unit) {
-    val ctx = LocalContext.current
-    var files by remember { mutableStateOf(Vault.list(ctx)) }
-    var del by remember { mutableStateOf<File?>(null) }
-    var info by remember { mutableStateOf<String?>(null) }
-    val export = rememberGalleryExporter { msg ->
-        info = msg
-        files = Vault.list(ctx)
-    }
-
-    Column(Modifier.fillMaxSize().statusBarsPadding()) {
-        Row(
-            Modifier.fillMaxWidth().padding(8.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            TextButton(onClick = onBack) { Text("< Voltar") }
-            Text("${files.size} itens no cofre")
-        }
-        Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp)) {
-            TextButton(onClick = { export(files) }, enabled = files.isNotEmpty()) {
-                Text("Exportar todos para a galeria")
-            }
-        }
-        info?.let {
-            Text(
-                it, Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
-                color = MaterialTheme.colorScheme.primary,
-                style = MaterialTheme.typography.bodySmall
-            )
-        }
-        LazyColumn(Modifier.fillMaxSize()) {
-            items(files, key = { it.name }) { f ->
-                val isPhoto = f.extension == "jpg"
-                val thumb = remember(f.name) {
-                    if (isPhoto) BitmapFactory.decodeFile(
-                        f.path, BitmapFactory.Options().apply { inSampleSize = 8 }
-                    ) else null
+                if (count > 1) TextButton(onClick = { c.seekToPreviousMediaItem() }) { Text("|<") }
+                TextButton(onClick = { c.seekBack() }) { Text("-10s") }
+                FilledIconButton(onClick = { if (playing) c.pause() else c.play() }) {
+                    Icon(
+                        if (playing) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                        contentDescription = "Play/Pause"
+                    )
                 }
-                Row(
-                    Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    if (thumb != null) {
-                        Image(
-                            thumb.asImageBitmap(), contentDescription = null,
-                            modifier = Modifier.size(64.dp)
-                        )
-                    } else {
-                        Box(
-                            Modifier.size(64.dp).background(Color(0xFF222222)),
-                            contentAlignment = Alignment.Center
-                        ) { Text("MP4") }
-                    }
-                    Column(Modifier.weight(1f).padding(start = 12.dp)) {
-                        Text(f.name)
-                        Text(
-                            "%.1f MB".format(f.length() / 1_048_576f),
-                            style = MaterialTheme.typography.bodySmall
-                        )
-                        Row {
-                            TextButton(onClick = { export(listOf(f)) }) { Text("Galeria") }
-                            TextButton(onClick = {
-                                val uri = Vault.export(ctx, f)
-                                val mime = if (isPhoto) "image/jpeg" else "video/mp4"
-                                val i = Intent(Intent.ACTION_SEND)
-                                    .setType(mime)
-                                    .putExtra(Intent.EXTRA_STREAM, uri)
-                                    .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                                ctx.startActivity(Intent.createChooser(i, null))
-                            }) { Text("Enviar") }
-                            TextButton(onClick = { del = f }) { Text("Apagar") }
-                        }
-                    }
-                }
-                HorizontalDivider()
+                TextButton(onClick = { c.seekForward() }) { Text("+10s") }
+                if (count > 1) TextButton(onClick = { c.seekToNextMediaItem() }) { Text(">|") }
             }
-        }
-    }
-
-    del?.let { f ->
-        AlertDialog(
-            onDismissRequest = { del = null },
-            title = { Text("Apagar de vez?") },
-            text = { Text("O arquivo será sobrescrito e excluído. Não dá para desfazer.") },
-            confirmButton = {
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceEvenly,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
                 TextButton(onClick = {
-                    Vault.wipe(f)
-                    files = Vault.list(ctx)
-                    del = null
-                }) { Text("Apagar") }
-            },
-            dismissButton = { TextButton(onClick = { del = null }) { Text("Cancelar") } }
-        )
-    }
-}
-
-// ---------------- Limpeza de metadados ----------------
-
-private class Picked(val uri: Uri, val name: String, val size: Long)
-private class Res(val name: String, val note: String, val ok: Boolean)
-
-private fun describe(ctx: Context, uri: Uri): Picked {
-    var name = "arquivo"
-    var size = -1L
-    try {
-        ctx.contentResolver.query(
-            uri, arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE), null, null, null
-        )?.use { q ->
-            if (q.moveToFirst()) {
-                val n = q.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                if (n >= 0) q.getString(n)?.let { name = it }
-                val s = q.getColumnIndex(OpenableColumns.SIZE)
-                if (s >= 0 && !q.isNull(s)) size = q.getLong(s)
-            }
-        }
-    } catch (e: Exception) {
-    }
-    if (!name.contains('.')) {
-        val ext = MimeTypeMap.getSingleton().getExtensionFromMimeType(ctx.contentResolver.getType(uri))
-        if (ext != null) name = "$name.$ext"
-    }
-    return Picked(uri, name, size)
-}
-
-private fun mb(bytes: Long): String =
-    if (bytes < 0) "tamanho desconhecido" else "%.1f MB".format(bytes / 1_048_576f)
-
-private fun shareFiles(ctx: Context, files: List<File>) {
-    if (files.isEmpty()) return
-    val uris = ArrayList(files.map { Vault.export(ctx, it, keepName = true) })
-    val i = if (uris.size == 1) {
-        Intent(Intent.ACTION_SEND)
-            .setType(Cleaner.mimeOf(files[0]))
-            .putExtra(Intent.EXTRA_STREAM, uris[0])
-    } else {
-        Intent(Intent.ACTION_SEND_MULTIPLE)
-            .setType("*/*")
-            .putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
-    }
-    i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-    ctx.startActivity(Intent.createChooser(i, null))
-}
-
-@Composable
-fun CleanScreen(incoming: MutableState<List<Uri>>, busyState: MutableState<Boolean>) {
-    val ctx = LocalContext.current
-    val scope = rememberCoroutineScope()
-    var picked by remember { mutableStateOf<List<Picked>>(emptyList()) }
-    var poison by remember { mutableStateOf(false) }
-    var randomName by remember { mutableStateOf(true) }
-    var progress by remember { mutableStateOf("") }
-    var results by remember { mutableStateOf<List<Res>>(emptyList()) }
-    var cleaned by remember { mutableStateOf(Cleaner.list(ctx)) }
-    var saving by remember { mutableStateOf<File?>(null) }
-    var info by remember { mutableStateOf<String?>(null) }
-    val busy = busyState.value
-    val export = rememberGalleryExporter { msg ->
-        info = msg
-        cleaned = Cleaner.list(ctx)
-    }
-
-    fun add(l: List<Uri>) {
-        val have = picked.map { it.uri }.toSet()
-        picked = picked + l.filter { it !in have }.map { describe(ctx, it) }
-    }
-
-    val picker = rememberLauncherForActivityResult(
-        ActivityResultContracts.OpenMultipleDocuments()
-    ) { uris -> add(uris) }
-
-    val saver = rememberLauncherForActivityResult(
-        ActivityResultContracts.CreateDocument("*/*")
-    ) { uri ->
-        val f = saving
-        saving = null
-        if (uri != null && f != null) {
-            scope.launch {
-                val ok = withContext(Dispatchers.IO) {
-                    try {
-                        ctx.contentResolver.openOutputStream(uri)?.use { o ->
-                            f.inputStream().use { it.copyTo(o) }
-                        }
-                        true
-                    } catch (e: Exception) {
-                        false
+                    val steps = listOf(0.75f, 1f, 1.25f, 1.5f, 2f)
+                    val next = steps.firstOrNull { it > speed + 0.01f } ?: steps.first()
+                    c.setPlaybackSpeed(next)
+                }) { Text("${speed}x") }
+                TextButton(onClick = {
+                    val next = when (repeat) {
+                        Player.REPEAT_MODE_OFF -> Player.REPEAT_MODE_ONE
+                        Player.REPEAT_MODE_ONE -> Player.REPEAT_MODE_ALL
+                        else -> Player.REPEAT_MODE_OFF
                     }
-                }
-                info = if (ok) "Arquivo salvo" else "Falha ao salvar"
-            }
-        }
-    }
-
-    LaunchedEffect(incoming.value) {
-        if (incoming.value.isNotEmpty()) {
-            add(incoming.value)
-            incoming.value = emptyList()
-        }
-    }
-
-    LazyColumn(
-        Modifier.fillMaxSize().statusBarsPadding(),
-        contentPadding = PaddingValues(16.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp)
-    ) {
-        item {
-            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text("Meta Cam", style = MaterialTheme.typography.headlineSmall)
-                Text(
-                    "Limpeza de metadados. Tudo roda no aparelho e os originais não são alterados.",
-                    style = MaterialTheme.typography.bodySmall
-                )
-                Text(
-                    "Fotos (JPG, PNG, WebP, HEIC), vídeo e áudio (MP4, MOV, M4A, 3GP), " +
-                        "documentos (DOCX, XLSX, PPTX, ODT, ODS, ODP) e PDF.",
-                    style = MaterialTheme.typography.bodySmall
-                )
-                info?.let { Text(it, color = MaterialTheme.colorScheme.primary) }
-            }
-        }
-        item {
-            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    FilterChip(
-                        selected = !poison, enabled = !busy,
-                        onClick = { poison = false }, label = { Text("Limpar") }
-                    )
-                    FilterChip(
-                        selected = poison, enabled = !busy,
-                        onClick = { poison = true }, label = { Text("Envenenar") }
-                    )
-                }
-                Text(
-                    if (poison) "Troca os metadados por valores falsos e plausíveis: aparelho, data, " +
-                        "local e autor. Só onde o formato permite."
-                    else "Remove metadados: EXIF, GPS, datas, autor e propriedades.",
-                    style = MaterialTheme.typography.bodySmall
-                )
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Switch(checked = randomName, enabled = !busy, onCheckedChange = { randomName = it })
-                    Spacer(Modifier.width(8.dp))
-                    Text("Nome de arquivo aleatório")
-                }
-            }
-        }
-        item {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(
-                    onClick = { picker.launch(arrayOf("*/*")) },
-                    enabled = !busy,
-                    modifier = Modifier.fillMaxWidth()
-                ) { Text("Selecionar arquivos") }
-                Button(
-                    onClick = {
-                        busyState.value = true
-                        results = emptyList()
-                        info = null
-                        val batch = picked
-                        val po = poison
-                        val rn = randomName
-                        scope.launch {
-                            val out = mutableListOf<Res>()
-                            for ((idx, p) in batch.withIndex()) {
-                                progress = "${idx + 1}/${batch.size}: ${p.name}"
-                                val o = withContext(Dispatchers.IO) {
-                                    Cleaner.process(ctx, p.uri, p.name, po, rn)
-                                }
-                                out.add(Res(p.name, o.note, o.ok))
-                            }
-                            results = out
-                            picked = emptyList()
-                            cleaned = Cleaner.list(ctx)
-                            progress = ""
-                            busyState.value = false
-                        }
-                    },
-                    enabled = picked.isNotEmpty() && !busy,
-                    modifier = Modifier.fillMaxWidth()
-                ) {
+                    c.repeatMode = next
+                    Store.setRepeat(ctx, next)
+                }) {
                     Text(
-                        if (picked.isEmpty()) "Nenhum arquivo selecionado"
-                        else (if (poison) "Envenenar " else "Limpar ") + "${picked.size} arquivo(s)"
-                    )
-                }
-                if (busy) {
-                    LinearProgressIndicator(Modifier.fillMaxWidth())
-                    Text(progress, maxLines = 1, overflow = TextOverflow.Ellipsis,
-                        style = MaterialTheme.typography.bodySmall)
-                }
-            }
-        }
-
-        if (picked.isNotEmpty()) {
-            item { Text("Selecionados", style = MaterialTheme.typography.titleMedium) }
-            items(picked, key = { it.uri.toString() }) { p ->
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f)) {
-                        Text(p.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        Text(mb(p.size), style = MaterialTheme.typography.bodySmall)
-                    }
-                    TextButton(
-                        onClick = { picked = picked.filter { it.uri != p.uri } },
-                        enabled = !busy
-                    ) { Text("Remover") }
-                }
-            }
-        }
-
-        if (results.isNotEmpty()) {
-            item { Text("Resultado", style = MaterialTheme.typography.titleMedium) }
-            items(results) { r ->
-                Column {
-                    Text(r.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    Text(
-                        r.note,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = if (r.ok) MaterialTheme.colorScheme.primary
-                        else MaterialTheme.colorScheme.error
-                    )
-                }
-            }
-        }
-
-        if (cleaned.isNotEmpty()) {
-            item {
-                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    HorizontalDivider()
-                    Text(
-                        "Arquivos limpos (${cleaned.size})",
-                        style = MaterialTheme.typography.titleMedium
-                    )
-                    Row {
-                        TextButton(onClick = { shareFiles(ctx, cleaned) }) { Text("Enviar todos") }
-                        TextButton(onClick = { export(cleaned) }, enabled = !busy) {
-                            Text("Galeria (todos)")
+                        when (repeat) {
+                            Player.REPEAT_MODE_ONE -> "Loop: 1 áudio"
+                            Player.REPEAT_MODE_ALL -> "Loop: lista"
+                            else -> "Loop: off"
                         }
-                    }
-                    Row {
-                        TextButton(
-                            onClick = {
-                                val all = cleaned
-                                scope.launch {
-                                    withContext(Dispatchers.IO) { all.forEach { Vault.wipe(it) } }
-                                    cleaned = Cleaner.list(ctx)
-                                }
-                            },
-                            enabled = !busy
-                        ) { Text("Apagar todos") }
-                    }
-                }
-            }
-            items(cleaned, key = { it.name }) { f ->
-                Column {
-                    Text(f.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    Text(mb(f.length()), style = MaterialTheme.typography.bodySmall)
-                    Row {
-                        TextButton(onClick = { shareFiles(ctx, listOf(f)) }) { Text("Enviar") }
-                        TextButton(onClick = { export(listOf(f)) }, enabled = !busy) { Text("Galeria") }
-                        TextButton(onClick = {
-                            saving = f
-                            saver.launch(f.name)
-                        }) { Text("Salvar") }
-                        TextButton(
-                            onClick = {
-                                scope.launch {
-                                    withContext(Dispatchers.IO) { Vault.wipe(f) }
-                                    cleaned = Cleaner.list(ctx)
-                                }
-                            },
-                            enabled = !busy
-                        ) { Text("Apagar") }
-                    }
-                    HorizontalDivider()
+                    )
                 }
             }
         }
